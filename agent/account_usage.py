@@ -748,6 +748,66 @@ def redeem_codex_reset_credit(
     )
 
 
+_LIVE_QUOTA_CACHE: dict[str, tuple[float, Optional[float]]] = {}
+_LIVE_QUOTA_TTL_SECONDS = 30.0
+
+
+def fetch_live_anthropic_utilization(token: str, *, cache_key: Optional[str] = None) -> Optional[float]:
+    """Return the highest utilization percent (0-100) across an OAuth account's usage windows.
+
+    Backs credential_pool's ``least_quota`` strategy: rather than a local
+    per-process ``request_count`` (which is just a proxy for load and doesn't
+    know how close an account actually is to its real 5h/7d Anthropic limit),
+    this hits the live ``/api/oauth/usage`` endpoint for one specific
+    credential's token and returns its worst-case (most-used) window so the
+    picker can favor whichever account has the most real headroom left.
+
+    Cached briefly per ``cache_key`` (defaults to the token itself) to avoid a
+    network round trip on every single rotation decision — selection can be
+    called once per request. Returns ``None`` on any failure (non-OAuth
+    token, network error, malformed payload) so callers fail open to a
+    request_count-based ordering instead of raising.
+    """
+    import time as _time
+
+    key = cache_key or token
+    now = _time.monotonic()
+    cached = _LIVE_QUOTA_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _LIVE_QUOTA_TTL_SECONDS:
+        return cached[1]
+
+    result: Optional[float] = None
+    try:
+        if token and _is_oauth_token(token):
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "anthropic-beta": "oauth-2025-04-20",
+                "User-Agent": "claude-code/2.1.0",
+            }
+            with httpx.Client(timeout=8.0) as client:
+                response = client.get("https://api.anthropic.com/api/oauth/usage", headers=headers)
+                response.raise_for_status()
+            payload = response.json() or {}
+            utils: list[float] = []
+            for window_key in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"):
+                window = payload.get(window_key) or {}
+                util = window.get("utilization")
+                if util is None:
+                    continue
+                pct = float(util)  # API returns percent (0-100); a <=1 heuristic misread 1% as 100%
+                utils.append(pct)
+            if utils:
+                result = max(utils)
+    except Exception:
+        logger.debug("Failed to fetch live Anthropic OAuth utilization", exc_info=True)
+        result = None
+
+    _LIVE_QUOTA_CACHE[key] = (now, result)
+    return result
+
+
 def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
     token = (resolve_anthropic_token() or "").strip()
     if not token:
@@ -782,7 +842,7 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         util = window.get("utilization")
         if util is None:
             continue
-        used = float(util) * 100 if float(util) <= 1 else float(util)
+        used = float(util)  # API returns percent (0-100); a <=1 heuristic misread 1% as 100%
         windows.append(
             AccountUsageWindow(
                 label=label,

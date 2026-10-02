@@ -110,11 +110,18 @@ STRATEGY_FILL_FIRST = "fill_first"
 STRATEGY_ROUND_ROBIN = "round_robin"
 STRATEGY_RANDOM = "random"
 STRATEGY_LEAST_USED = "least_used"
+# Real-time quota strategy: picks the OAuth entry with the most remaining
+# headroom on Anthropic's live /api/oauth/usage windows (5h/7d), instead of
+# the local request_count proxy that least_used uses. Falls back to
+# request_count ordering per-entry when a live reading isn't available
+# (API-key entries, network failure) — see account_usage.fetch_live_anthropic_utilization.
+STRATEGY_LEAST_QUOTA = "least_quota"
 SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
     STRATEGY_RANDOM,
     STRATEGY_LEAST_USED,
+    STRATEGY_LEAST_QUOTA,
 }
 
 # Cooldown before retrying an exhausted credential.
@@ -2016,9 +2023,52 @@ class CredentialPool:
 
         if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
             entry = min(available, key=lambda e: e.request_count)
-            # Increment usage counter so subsequent selections distribute load
+            # Increment usage counter so subsequent selections distribute load.
+            # Must persist to auth.json (not just update self._entries in
+            # memory): load_pool() re-reads the pool fresh from disk on every
+            # call (no cross-process/cross-call caching), so an unpersisted
+            # counter is discarded before the next selection ever sees it —
+            # every subsequent call would recompute request_count=0 for all
+            # entries and min() would deterministically re-pick the same
+            # (first/lowest-priority) entry forever, defeating rotation
+            # entirely. round_robin already persists for the same reason.
             updated = replace(entry, request_count=entry.request_count + 1)
             self._replace_entry(entry, updated)
+            self._persist()
+            self._current_id = entry.id
+            return updated, pending_refresh
+
+        if self._strategy == STRATEGY_LEAST_QUOTA and len(available) > 1 and self.provider == "anthropic":
+            # Real quota, not a local proxy: ask Anthropic's live
+            # /api/oauth/usage for each OAuth entry's worst-case (5h/7d)
+            # utilization and pick whichever account has the most real
+            # headroom left. Entries that aren't OAuth, or whose live probe
+            # fails (network error, rate-limited itself), fall back to the
+            # request_count ordering used by least_used so a transient API
+            # hiccup never stalls rotation entirely.
+            try:
+                from agent.account_usage import fetch_live_anthropic_utilization
+            except Exception:
+                fetch_live_anthropic_utilization = None  # type: ignore[assignment]
+
+            def _quota_key(candidate: PooledCredential) -> Tuple[int, float, int]:
+                live_pct: Optional[float] = None
+                if fetch_live_anthropic_utilization is not None and candidate.auth_type == AUTH_TYPE_OAUTH:
+                    token = str(candidate.access_token or "").strip()
+                    if token:
+                        live_pct = fetch_live_anthropic_utilization(token, cache_key=candidate.id)
+                # (0, pct, count): entries with a real live reading sort first
+                # among themselves by ascending utilization; entries without
+                # one (fetch failed / not OAuth) sort after, ordered by the
+                # local request_count fallback.
+                if live_pct is not None:
+                    return (0, live_pct, candidate.request_count)
+                return (1, 0.0, candidate.request_count)
+
+            entry = min(available, key=_quota_key)
+            updated = replace(entry, request_count=entry.request_count + 1)
+            self._replace_entry(entry, updated)
+            self._persist()
             self._current_id = entry.id
             return updated, pending_refresh
 

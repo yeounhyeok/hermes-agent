@@ -5581,6 +5581,7 @@ class AIAgent:
         """
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
+            self._log_anthropic_credential_use()
         key = self._request_anthropic_client_key()
 
         stale = None
@@ -6248,6 +6249,37 @@ class AIAgent:
         logger.info("Copilot credentials re-exchanged after stale-credential 400 (source=%s)", token_source)
         return True
 
+    def _log_anthropic_credential_use(self) -> None:
+        """Log which pool entry actually backs outgoing Anthropic requests.
+
+        Emits one INFO line only when the entry (by token fingerprint) changes
+        for this agent, so it is cheap and shows real wire usage rather than the
+        pool's local selection counter.
+        """
+        try:
+            token = str(getattr(self, "_anthropic_api_key", "") or "")
+            if not token or self.provider != "anthropic":
+                return
+            import hashlib
+
+            fp = hashlib.sha256(token.encode()).hexdigest()[:8]
+            if getattr(self, "_last_logged_anthropic_fp", None) == fp:
+                return
+            self._last_logged_anthropic_fp = fp
+            entry_id = label = "?"
+            pool = getattr(self, "_credential_pool", None)
+            if pool is not None:
+                for _e in pool.entries():
+                    if (getattr(_e, "runtime_api_key", None) or getattr(_e, "access_token", "")) == token:
+                        entry_id, label = _e.id, _e.label
+                        break
+            logger.info(
+                "Anthropic request credential: entry=%s (%s) fp=%s pool_bound=%s",
+                entry_id, label, fp, pool is not None,
+            )
+        except Exception:
+            logger.debug("anthropic credential log failed", exc_info=True)
+
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
             return False
@@ -6264,7 +6296,29 @@ class AIAgent:
         try:
             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
 
-            new_token = resolve_anthropic_token()
+            new_token = None
+            # Pool-bound agent: stay on the credential the pool selected
+            # (least_quota / rotation) and only pick up that SAME entry's
+            # refreshed token. resolve_anthropic_token() would return the
+            # first pool entry regardless of strategy and silently undo the
+            # pool's selection on every request.
+            _pool = getattr(self, "_credential_pool", None)
+            if _pool is not None:
+                _entry_id = getattr(self, "_credential_pool_entry_id", None)
+                if not _entry_id:
+                    try:
+                        _entry_id = _pool.entry_id_for_api_key(self._anthropic_api_key)
+                    except Exception:
+                        _entry_id = None
+                if _entry_id:
+                    from agent.credential_pool import load_pool
+
+                    for _e in load_pool("anthropic").entries():
+                        if _e.id == _entry_id:
+                            new_token = (getattr(_e, "access_token", None) or "").strip() or None
+                            break
+            if not new_token:
+                new_token = resolve_anthropic_token()
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False
